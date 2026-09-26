@@ -103,9 +103,10 @@ class SaverEE : public Saver {
         return write(true);
     }
 
-    // тикер автоматического режима, вызывать в loop
-    Status tick() {
-        return _tickCore() ? write() : None;
+    // тикер автоматического режима, allowWrite - разрешить физическую запись
+    Status tick(bool allowWrite = true) {
+        if (!_tickCore()) return None;
+        return allowWrite ? write() : None;
     }
 
     // размер всего блока (данные + хэдер)
