@@ -16,7 +16,10 @@ Library for storing binary settings and other static data in EEPROM or files
 - Postponed recording after termination of changes
 - Data version to reset incompatible format
 - Preservation of old fields with increasing structure
-- Secure file recording via temporary file + rename + recovery
+- Three File Strategies: Direct / Atomic / Backup
+- Recovery after an unfinished recording
+- Separate FileStore for secure recording of any files
+- It is a more convenient and secure library replacement. n[EEManager](https://github.com/GyverLibs/EEManager)and[FileData](https://github.com/GyverLibs/FileData)
 
 ### Compatibility
 - Arduino-platforms with standard`EEPROM.h`
@@ -48,15 +51,17 @@ SaverEE statSaver(stat, cfgSaver.nextAddr(), 'A');
 ### SaverFile
 
 ```cpp
-SaverFile(fs::FS& fs, const char* path, T& data, uint8_t ver = 'A', uint8_t toutSec = 10);
-SaverFile(fs::FS& fs, const char* path, void* data, uint16_t size, uint8_t ver = 'A', uint8_t toutSec = 10);
+SaverFile(fs::FS& fs, const char* path, T& data, uint8_t ver = 'A', uint8_t toutSec = 10, FileStore::Mode mode = FileStore::Atomic);
+SaverFile(fs::FS& fs, const char* path, void* data, uint16_t size, uint8_t ver = 'A', uint8_t toutSec = 10, FileStore::Mode mode = FileStore::Atomic);
 ```
 
 - `fs`- file system
 - `path`- the path to the file, for example`"/config.cfg"`
 - Other arguments are similar.`SaverEE`
+- `mode`- file recording strategy:`FileStore::Direct`, `FileStore::Atomic`or`FileStore::Backup`
+- By default.`SaverFile`exploit`FileStore::Atomic`
 
-For temporary and backup files, Saver adds suffixes to the path`.t`and`.b`. The internal path buffer has a size of 32 bytes, so the length of the original path should not be more than 29 characters.
+For regimes`Atomic`and`Backup`FileStore adds suffixes to path`.t`and`.b`. The internal path buffer has a size of 32 bytes, so the length of the original path should not be more than 29 characters. For`Direct`This restriction is not required.
 
 ### Methods
 ```cpp
@@ -76,8 +81,8 @@ Status reset();
 Status reset(const T& data);
 Status reset(const void* data, uint16_t size);
 
-// Automatic ticker, call in the loop
-Status tick();
+// Automatic mode ticker, allowWrite - allow physical recording
+Status tick(bool allowWrite = true);
 
 // size
 uint16_t dataSize();
@@ -166,20 +171,119 @@ If the version in the vault doesn’t match, ** upon launch** Saver will leave t
 
 The second option is to transfer to`reset()`An object with omission, such as a new structure:`saver.reset(Config())`. In this case, the reset and upgrade of the storage will occur immediately.
 
+Some processes can lead to dyeing during recording, so`tick()`Recording permission can be transmitted:
+
+```cpp
+saver.tick(!radioBusy);
+```
+
+By default, recording is allowed.
+
 ### Secure recording
-The new file is first written to a temporary:
+
+`SaverFile`It uses a separate helper.`FileStore`It supports three recording strategies:
+
+```cpp
+FileStore::Direct
+FileStore::Atomic
+FileStore::Backup
+```
+
+`Direct`Writes directly to the main file. This is the easiest and fastest mode, but if power fails during writing, the file can be damaged.
+
+`Atomic`First, write the new file into a temporary one:
 
 ```text
 /config.cfg.t
 ```
 
-After successful recording, rename is performed. If the file system is unable to replace an existing file via rename, the old file is temporarily transferred to:
+After successful recording, the temporary file replaces the main file.`rename()`. This mode is suitable for file systems where replace via rename is atomic, such as LittleFS.
+
+`Backup`It uses a three-file diagram:
 
 ```text
+/config.cfg
+/config.cfg.t
 /config.cfg.b
 ```
 
-The following`begin()`Saver checks the main, temporary and backup file and restores a valid copy after an unfinished record. CRC protects data from downloading a damaged or unwritten block.
+The new data is first recorded in`.t`The old main file is transferred to`.b`Then`.t`It's becoming mainstream. After successful completion, the backup is removed. This mode does not rely on atomic replace and is used in`SaverFile`by default.
+
+Before reading and writing`SaverFile`Recovery: Checks the main, temporary and backup file over CRC and restores a valid copy after an unfinished record.
+
+For LittleFS, you can clearly choose a lighter one.`Atomic`:
+
+```cpp
+SaverFile saver(
+    LittleFS,
+    "/config.cfg",
+    config,
+    'A',
+    10,
+    FileStore::Atomic
+);
+```
+
+### FileStore
+
+`FileStore`Can be used separately from Saver to securely record any files:
+
+```cpp
+#include <FileStore.h>
+
+FileStore store(FileStore::Atomic);
+
+File file = store.open(LittleFS, "/data.bin", "w");
+if (file) {
+    bool ok = file.write(data, size) == size;
+    store.close(LittleFS, "/data.bin", file, ok);
+}
+```
+
+Default is used`Direct`:
+
+```cpp
+FileStore store;
+```
+
+For convenience, the file system can be linked via factory:
+
+```cpp
+auto store = makeFileStore(LittleFS, FileStore::Atomic);
+
+File file = store.open("/data.bin", "w");
+if (file) {
+    bool ok = file.write(data, size) == size;
+    store.close("/data.bin", file, ok);
+}
+```
+
+`FileStore`It uses template methods and works not only with`fs::FS`But also with compatible wrappers that have methods.`open`, `exists`, `remove`and`rename`.
+
+Basic methods:
+
+```cpp
+FileStore(FileStore::Mode mode = FileStore::Direct);
+
+File open(fs, path, mode = "r");
+bool close(fs, path, file, bool ok = true);
+bool recover(fs, path, validator);
+bool remove(fs, path);
+```
+
+`recover()`receives the validator function:
+
+```cpp
+store.recover(LittleFS, "/data.bin", [](File& file) {
+    return file.size() > 0;
+});
+```
+
+For`Atomic`and`Backup`Secure transaction record maintained for mode`"w"`. Regimes`"a"`, `"r+"`Other changing modes are deliberately not supported because they require a different transaction scheme.
+
+`store.close()`It completes the transaction record:`flush`Closes the file and executes the commit strategy. Don't call.`file.close()`beforehand`store.close()`.
+
+You can conduct transactions on different paths at the same time, but there should be only one active record for one logical path.
 
 ## Model scenarios
 ### Normal settings
@@ -287,7 +391,7 @@ Config config;
 SaverFile saver(LittleFS, "/config.cfg", config);
 
 void setup() {
-    LittleFS.begin();
+    LittleFS.begin(true);
     saver.begin();
 }
 
