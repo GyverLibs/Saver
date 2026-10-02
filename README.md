@@ -14,7 +14,9 @@
 - Отложенная запись после прекращения изменений
 - Версия данных для сброса несовместимого формата
 - Сохранение старых полей при увеличении структуры
-- Безопасная запись файла через временный файл + rename + recovery
+- Три стратегии записи файлов: Direct / Atomic / Backup
+- Восстановление после незавершённой записи
+- Отдельный FileStore для безопасной записи любых файлов
 - Это более удобная и безопасная замена библиотекам [EEManager](https://github.com/GyverLibs/EEManager) и [FileData](https://github.com/GyverLibs/FileData)
 
 ### Совместимость
@@ -47,15 +49,17 @@ SaverEE statSaver(stat, cfgSaver.nextAddr(), 'A');
 ### SaverFile
 
 ```cpp
-SaverFile(fs::FS& fs, const char* path, T& data, uint8_t ver = 'A', uint8_t toutSec = 10);
-SaverFile(fs::FS& fs, const char* path, void* data, uint16_t size, uint8_t ver = 'A', uint8_t toutSec = 10);
+SaverFile(fs::FS& fs, const char* path, T& data, uint8_t ver = 'A', uint8_t toutSec = 10, FileStore::Mode mode = FileStore::Atomic);
+SaverFile(fs::FS& fs, const char* path, void* data, uint16_t size, uint8_t ver = 'A', uint8_t toutSec = 10, FileStore::Mode mode = FileStore::Atomic);
 ```
 
 - `fs` - файловая система
 - `path` - путь к файлу, например `"/config.cfg"`
 - Остальные аргументы аналогичны `SaverEE`
+- `mode` - стратегия записи файла: `FileStore::Direct`, `FileStore::Atomic` или `FileStore::Backup`
+- По умолчанию `SaverFile` использует `FileStore::Atomic`
 
-Для временного и резервного файла Saver добавляет к пути суффиксы `.t` и `.b`. Внутренний буфер пути имеет размер 32 байта, поэтому длина исходного пути должна быть не больше 29 символов.
+Для режимов `Atomic` и `Backup` FileStore добавляет к пути суффиксы `.t` и `.b`. Внутренний буфер пути имеет размер 32 байта, поэтому длина исходного пути должна быть не больше 29 символов. Для `Direct` это ограничение не требуется.
 
 ### Методы
 ```cpp
@@ -174,19 +178,110 @@ saver.tick(!radioBusy);
 По умолчанию запись разрешена.
 
 ### Безопасная запись
-Новый файл сначала записывается во временный:
+
+`SaverFile` использует отдельный helper `FileStore`, который поддерживает три стратегии записи:
+
+```cpp
+FileStore::Direct
+FileStore::Atomic
+FileStore::Backup
+```
+
+`Direct` записывает сразу в основной файл. Это самый простой и быстрый режим, но при сбое питания во время записи файл может быть повреждён.
+
+`Atomic` сначала записывает новый файл во временный:
 
 ```text
 /config.cfg.t
 ```
 
-После успешной записи выполняется rename. Если файловая система не умеет заменять существующий файл через rename, старый файл временно переносится в:
+После успешной записи временный файл заменяет основной через `rename()`. Этот режим подходит для файловых систем, где replace через rename является атомарным, например LittleFS.
+
+`Backup` использует трёхфайловую схему:
 
 ```text
+/config.cfg
+/config.cfg.t
 /config.cfg.b
 ```
 
-При следующем `begin()` Saver проверяет основной, временный и backup-файл и восстанавливает валидную копию после незавершённой записи. CRC защищает данные от загрузки повреждённого или недописанного блока.
+Новые данные сначала записываются в `.t`, старый основной файл переносится в `.b`, после чего `.t` становится основным. После успешного завершения backup удаляется. Этот режим не полагается на atomic replace и используется в `SaverFile` по умолчанию.
+
+Перед чтением и записью `SaverFile` выполняет recovery: проверяет основной, временный и backup-файл по CRC и восстанавливает валидную копию после незавершённой записи.
+
+Для LittleFS можно явно выбрать более лёгкий `Atomic`:
+
+```cpp
+SaverFile saver(
+    LittleFS,
+    "/config.cfg",
+    config,
+    'A',
+    10,
+    FileStore::Atomic
+);
+```
+
+### FileStore
+
+`FileStore` можно использовать отдельно от Saver для безопасной записи любых файлов:
+
+```cpp
+#include <FileStore.h>
+
+FileStore store(FileStore::Atomic);
+
+File file = store.open(LittleFS, "/data.bin", "w");
+if (file) {
+    bool ok = file.write(data, size) == size;
+    store.close(LittleFS, "/data.bin", file, ok);
+}
+```
+
+По умолчанию используется `Direct`:
+
+```cpp
+FileStore store;
+```
+
+Для удобства файловую систему можно привязать через factory:
+
+```cpp
+auto store = makeFileStore(LittleFS, FileStore::Atomic);
+
+File file = store.open("/data.bin", "w");
+if (file) {
+    bool ok = file.write(data, size) == size;
+    store.close("/data.bin", file, ok);
+}
+```
+
+`FileStore` использует шаблонные методы и работает не только с `fs::FS`, но и с совместимыми обёртками, у которых есть методы `open`, `exists`, `remove` и `rename`.
+
+Основные методы:
+
+```cpp
+FileStore(FileStore::Mode mode = FileStore::Direct);
+
+File open(fs, path, mode = "r");
+bool close(fs, path, file, bool ok = true);
+bool recover(fs, path, validator);
+bool remove(fs, path);
+```
+
+`recover()` принимает функцию-валидатор:
+
+```cpp
+store.recover(LittleFS, "/data.bin", [](File& file) {
+    return file.size() > 0;
+});
+```
+
+Для `Atomic` и `Backup` безопасная транзакционная запись поддерживается для режима `"w"`. Режимы `"a"`, `"r+"` и другие изменяющие режимы намеренно не поддерживаются, потому что требуют другой схемы транзакции.
+
+`store.close()` завершает именно транзакционную запись: делает `flush`, закрывает файл и выполняет выбранную стратегию commit. Не нужно вызывать `file.close()` перед `store.close()`.
+
+Одновременно можно вести транзакции по разным путям, но для одного логического пути должна быть только одна активная запись.
 
 ## Типовые сценарии
 ### Обычные настройки
@@ -294,7 +389,7 @@ Config config;
 SaverFile saver(LittleFS, "/config.cfg", config);
 
 void setup() {
-    LittleFS.begin();
+    LittleFS.begin(true);
     saver.begin();
 }
 

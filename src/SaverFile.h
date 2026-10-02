@@ -3,31 +3,29 @@
 #include <FS.h>
 #include <string.h>
 
+#include "FileStore.h"
 #include "Saver.h"
 
 class SaverFile : public Saver {
-    static constexpr size_t PathSize = 32;
-
    public:
     template <typename T>
-    SaverFile(fs::FS& fs, const char* path, T& data, uint8_t ver = 'A', uint8_t toutSec = 10)
-        : Saver(&data, _typeSize<T>(), ver, toutSec), _fs(&fs), _path(path) {}
+    SaverFile(fs::FS& fs, const char* path, T& data, uint8_t ver = 'A', uint8_t toutSec = 10, FileStore::Mode mode = FileStore::Atomic)
+        : Saver(&data, _typeSize<T>(), ver, toutSec), _fs(&fs), _path(path), _store(mode) {}
 
-    SaverFile(fs::FS& fs, const char* path, void* data, uint16_t size, uint8_t ver = 'A', uint8_t toutSec = 10)
-        : Saver(data, size, ver, toutSec), _fs(&fs), _path(path) {}
+    SaverFile(fs::FS& fs, const char* path, void* data, uint16_t size, uint8_t ver = 'A', uint8_t toutSec = 10, FileStore::Mode mode = FileStore::Atomic)
+        : Saver(data, size, ver, toutSec), _fs(&fs), _path(path), _store(mode) {}
 
     // запустить систему, прочитать данные. allowGrow - разрешить увеличение без сброса к заводским настройкам
     Status begin(bool allowGrow = false) {
         _synced = false;
-        if (!_valid()) return Error;
-        if (!_recover()) return Error;
+        if (!_valid() || !_recover()) return Error;
 
         if (!_fs->exists(_path)) {
             if (write(true) == Error) return Error;
             return Default;
         }
 
-        File file = _fs->open(_path, "r");
+        File file = _store.open(*_fs, _path);
         if (!file) return Error;
 
         Header hdr;
@@ -75,55 +73,22 @@ class SaverFile : public Saver {
         if (!force && _synced && _ramCrc == _storeCrc) return None;
         if (!_recover()) return Error;
 
-        Path path(_path);
-
-        _fs->remove(path.tmp());
-
-        File file = _fs->open(path.tmp(), "w");
+        File file = _store.open(*_fs, _path, "w");
         if (!file) return Error;
 
         Header hdr = {_ramCrc, _size, _ver};
         bool ok = file.write((const uint8_t*)&hdr, sizeof(Header)) == sizeof(Header) &&
                   file.write((const uint8_t*)_data, _size) == _size;
-        file.flush();
-        file.close();
 
-        if (!ok) {
-            _fs->remove(path.tmp());
-            return Error;
-        }
+        if (!_store.close(*_fs, _path, file, ok)) return Error;
 
-        if (_fs->rename(path.tmp(), _path)) {
-            _fs->remove(path.bak());
-            _syncCrc(_ramCrc);
-            return Write;
-        }
-
-        if (!_fs->exists(_path)) return Error;
-
-        _fs->remove(path.bak());
-        if (!_fs->rename(_path, path.bak())) return Error;
-
-        if (!_fs->rename(path.tmp(), _path)) {
-            _fs->rename(path.bak(), _path);
-            return Error;
-        }
-
-        _fs->remove(path.bak());
         _syncCrc(_ramCrc);
         return Write;
     }
 
     // инвалидировать блок (данные сбросятся на умолчания при следующем запуске программы и вызове begin)
     Status reset() {
-        if (!_valid()) return Error;
-
-        Path path(_path);
-
-        if (_fs->exists(path.tmp()) && !_fs->remove(path.tmp())) return Error;
-        if (_fs->exists(path.bak()) && !_fs->remove(path.bak())) return Error;
-        if (_fs->exists(_path) && !_fs->remove(_path)) return Error;
-
+        if (!_valid() || !_store.remove(*_fs, _path)) return Error;
         _synced = false;
         return Write;
     }
@@ -138,7 +103,6 @@ class SaverFile : public Saver {
     // сбросить до указанных значений
     Status reset(const void* data, uint16_t size) {
         if (!data || size != _size) return Error;
-
         memcpy(_data, data, size);
         return write(true);
     }
@@ -157,33 +121,12 @@ class SaverFile : public Saver {
     }
 
     bool _valid() const {
-        return _fs && _path && _path[0] && _data && _size && strlen(_path) + 3 <= PathSize;
+        return _fs && _data && _size && _store.valid(_path);
     }
 
-    struct Path {
-        char buf[PathSize];
-        uint8_t len;
-
-        Path(const char* path) : len(strlen(path)) {
-            memcpy(buf, path, len);
-        }
-
-        const char* tmp() {
-            return _suffix('t');
-        }
-
-        const char* bak() {
-            return _suffix('b');
-        }
-
-       private:
-        const char* _suffix(char c) {
-            buf[len] = '.';
-            buf[len + 1] = c;
-            buf[len + 2] = 0;
-            return buf;
-        }
-    };
+    bool _recover() {
+        return _store.recover(*_fs, _path, [this](File& file) { return _validFile(file); });
+    }
 
     uint16_t _storedCrc(File& file, const Header& hdr) {
         uint16_t crc = 0xFFFF;
@@ -199,50 +142,17 @@ class SaverFile : public Saver {
         return crc;
     }
 
-    bool _validFile(const char* path) {
-        File file = _fs->open(path, "r");
-        if (!file || file.size() < sizeof(Header)) return false;
+    bool _validFile(File& file) {
+        if (file.size() < sizeof(Header)) return false;
 
         Header hdr;
         bool ok = file.read((uint8_t*)&hdr, sizeof(Header)) == sizeof(Header) &&
                   file.size() == (size_t)sizeof(Header) + hdr.size;
         if (ok) ok = _storedCrc(file, hdr) == hdr.crc;
-        file.close();
         return ok;
-    }
-
-    bool _recover() {
-        Path path(_path);
-
-        bool hasTmp = _fs->exists(path.tmp());
-        bool hasBak = _fs->exists(path.bak());
-        if (!hasTmp && !hasBak) return true;
-
-        if (_fs->exists(_path) && _validFile(_path)) {
-            if (hasTmp) _fs->remove(path.tmp());
-            if (hasBak) _fs->remove(path.bak());
-            return true;
-        }
-
-        if (hasTmp && _validFile(path.tmp())) {
-            _fs->remove(_path);
-            if (!_fs->rename(path.tmp(), _path)) return false;
-            if (hasBak) _fs->remove(path.bak());
-            return true;
-        }
-
-        if (hasBak && _validFile(path.bak())) {
-            _fs->remove(_path);
-            if (!_fs->rename(path.bak(), _path)) return false;
-            if (hasTmp) _fs->remove(path.tmp());
-            return true;
-        }
-
-        if (hasTmp) _fs->remove(path.tmp());
-        if (hasBak) _fs->remove(path.bak());
-        return true;
     }
 
     fs::FS* _fs;
     const char* _path;
+    FileStore _store;
 };
