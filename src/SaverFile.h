@@ -15,6 +15,15 @@ class SaverFile : public Saver {
     SaverFile(fs::FS& fs, const char* path, void* data, uint16_t size, uint8_t ver = 'A', uint8_t toutSec = 10, FileStore::Mode mode = FileStore::Atomic)
         : Saver(data, size, ver, toutSec), _fs(&fs), _path(path), _store(mode) {}
 
+    SaverFile(fs::FS& fs, const char* path, SaverBlocks blocks, uint8_t ver = 'A', uint8_t toutSec = 10, FileStore::Mode mode = FileStore::Atomic)
+        : Saver(blocks.data, blocks.count, ver, toutSec), _fs(&fs), _path(path), _store(mode) {}
+
+    template <size_t N, typename... Args>
+    SaverFile(fs::FS&, const char*, SaverBlock (&)[N], Args...) = delete;
+
+    template <size_t N, typename... Args>
+    SaverFile(fs::FS&, const char*, const SaverBlock (&)[N], Args...) = delete;
+
     // запустить систему, прочитать данные. allowGrow - разрешить увеличение без сброса к заводским настройкам
     Status begin(bool allowGrow = false) {
         _synced = false;
@@ -42,7 +51,9 @@ class SaverFile : public Saver {
             }
 
             uint16_t readSize = grow ? hdr.size : _size;
-            bool readOk = file.read(_data, readSize) == readSize;
+            bool readOk = _each(readSize, [&](uint8_t* data, uint16_t size) {
+                return file.read(data, size) == size;
+            });
             file.close();
             if (!readOk) return Error;
 
@@ -78,7 +89,9 @@ class SaverFile : public Saver {
 
         Header hdr = {_ramCrc, _size, _ver};
         bool ok = file.write((const uint8_t*)&hdr, sizeof(Header)) == sizeof(Header) &&
-                  file.write((const uint8_t*)_data, _size) == _size;
+                  _each(_size, [&](uint8_t* data, uint16_t size) {
+                      return file.write(data, size) == size;
+                  });
 
         if (!_store.close(*_fs, _path, file, ok)) return Error;
 
@@ -102,8 +115,8 @@ class SaverFile : public Saver {
 
     // сбросить до указанных значений
     Status reset(const void* data, uint16_t size) {
-        if (!data || size != _size) return Error;
-        memcpy(_data, data, size);
+        if (!data || size != _size || !_validData()) return Error;
+        _copyData(data, size);
         return write(true);
     }
 
@@ -121,7 +134,7 @@ class SaverFile : public Saver {
     }
 
     bool _valid() const {
-        return _fs && _data && _size && _store.valid(_path);
+        return _fs && _validData() && _store.valid(_path);
     }
 
     bool _recover() {

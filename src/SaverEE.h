@@ -14,6 +14,15 @@ class SaverEE : public Saver {
     SaverEE(void* data, uint16_t size, uint16_t addr = 0, uint8_t ver = 'A', uint8_t toutSec = 10)
         : Saver(data, size, ver, toutSec), _addr(addr) {}
 
+    SaverEE(SaverBlocks blocks, uint16_t addr = 0, uint8_t ver = 'A', uint8_t toutSec = 10)
+        : Saver(blocks.data, blocks.count, ver, toutSec), _addr(addr) {}
+
+    template <size_t N, typename... Args>
+    SaverEE(SaverBlock (&)[N], Args...) = delete;
+
+    template <size_t N, typename... Args>
+    SaverEE(const SaverBlock (&)[N], Args...) = delete;
+
     // запустить систему, прочитать данные. allowGrow - разрешить увеличение без сброса к заводским настройкам
     Status begin(bool allowGrow = false) {
         _synced = false;
@@ -26,9 +35,11 @@ class SaverEE : public Saver {
 
         if ((hdr.match(_size, _ver) || grow) && _storedCrc(hdr) == hdr.crc) {
             uint16_t readSize = grow ? hdr.size : _size;
-            for (uint16_t i = 0; i < readSize; i++) {
-                _data[i] = EEPROM.read(_addr + sizeof(Header) + i);
-            }
+            uint16_t addr = _addr + sizeof(Header);
+            _each(readSize, [&](uint8_t* data, uint16_t size) {
+                while (size--) *data++ = EEPROM.read(addr++);
+                return true;
+            });
 
             if (grow) {
                 if (write(true) == Error) return Error;
@@ -57,9 +68,11 @@ class SaverEE : public Saver {
 
         Header hdr = {_ramCrc, _size, _ver};
 
-        for (uint16_t i = 0; i < _size; i++) {
-            _writeByte(_addr + sizeof(Header) + i, _data[i]);
-        }
+        uint16_t addr = _addr + sizeof(Header);
+        _each(_size, [&](uint8_t* data, uint16_t size) {
+            while (size--) _writeByte(addr++, *data++);
+            return true;
+        });
 
         const uint8_t* p = (const uint8_t*)&hdr;
         for (uint8_t i = 2; i < sizeof(Header); i++) _writeByte(_addr + i, p[i]);
@@ -97,9 +110,9 @@ class SaverEE : public Saver {
 
     // сбросить до указанных значений
     Status reset(const void* data, uint16_t size) {
-        if (!data || size != _size) return Error;
+        if (!data || size != _size || !_validData()) return Error;
 
-        memcpy(_data, data, size);
+        _copyData(data, size);
         return write(true);
     }
 
@@ -132,7 +145,7 @@ class SaverEE : public Saver {
     }
 
     bool _validBlock() const {
-        if (!_data || !_size) return false;
+        if (!_validData()) return false;
         uint32_t end = (uint32_t)_addr + sizeof(Header) + _size;
         return end <= (uint32_t)EEPROM.length() && end <= UINT16_MAX;
     }

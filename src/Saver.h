@@ -1,6 +1,32 @@
 #pragma once
 #include <Arduino.h>
 
+struct SaverBlock {
+    void* data;
+    uint16_t size;
+};
+
+template <typename T>
+SaverBlock saverBlock(T& data) {
+    static_assert(sizeof(T) <= UINT16_MAX, "Saver block is too large");
+    return {&data, (uint16_t)sizeof(T)};
+}
+
+struct SaverBlocks {
+    const SaverBlock* data;
+    uint16_t count;
+};
+
+template <size_t N>
+SaverBlocks saverBlocks(const SaverBlock (&blocks)[N]) {
+    static_assert(N <= UINT16_MAX, "Too many Saver blocks");
+    return {blocks, (uint16_t)N};
+}
+
+inline SaverBlocks saverBlocks(const SaverBlock* blocks, uint16_t count) {
+    return {blocks, count};
+}
+
 class Saver {
    public:
     enum Status : uint8_t {
@@ -50,6 +76,38 @@ class Saver {
         setTimeout(toutSec);
     }
 
+    Saver(const SaverBlock* blocks, uint16_t count, uint8_t ver, uint8_t toutSec)
+        : Saver((void*)blocks, _blocksSize(blocks, count), ver, toutSec) {
+        _blockCount = count;
+    }
+
+    bool _validData() const {
+        if (!_data || !_size) return false;
+        if (!_blockCount) return true;
+        return _blocksSize((const SaverBlock*)_data, _blockCount) == _size;
+    }
+
+    template <typename F>
+    bool _each(uint16_t size, F fn) const {
+        if (!_blockCount) return fn(_data, size);
+        const SaverBlock* blocks = (const SaverBlock*)_data;
+        for (uint16_t i = 0; i < _blockCount && size; i++) {
+            uint16_t n = blocks[i].size < size ? blocks[i].size : size;
+            if (!fn((uint8_t*)blocks[i].data, n)) return false;
+            size -= n;
+        }
+        return !size;
+    }
+
+    bool _copyData(const void* data, uint16_t size) const {
+        const uint8_t* src = (const uint8_t*)data;
+        return _each(size, [&](uint8_t* dst, uint16_t n) {
+            memcpy(dst, src, n);
+            src += n;
+            return true;
+        });
+    }
+
     uint16_t _calcCrc(uint16_t size, uint8_t ver, const uint8_t* data) const {
         uint16_t crc = 0xFFFF;
         _crcByte(crc, (uint8_t)size);
@@ -60,7 +118,26 @@ class Saver {
     }
 
     uint16_t _calcCrc() const {
-        return _calcCrc(_size, _ver, _data);
+        uint16_t crc = 0xFFFF;
+        _crcByte(crc, (uint8_t)_size);
+        _crcByte(crc, (uint8_t)(_size >> 8));
+        _crcByte(crc, _ver);
+        _each(_size, [&](uint8_t* data, uint16_t size) {
+            while (size--) _crcByte(crc, *data++);
+            return true;
+        });
+        return crc;
+    }
+
+    static uint16_t _blocksSize(const SaverBlock* blocks, uint16_t count) {
+        if (!blocks || !count) return 0;
+        uint32_t size = 0;
+        for (uint16_t i = 0; i < count; i++) {
+            if (!blocks[i].data || !blocks[i].size) return 0;
+            size += blocks[i].size;
+            if (size > UINT16_MAX) return 0;
+        }
+        return (uint16_t)size;
     }
 
     void _syncCrc(uint16_t crc) {
@@ -92,6 +169,7 @@ class Saver {
 
     uint8_t* _data;
     uint16_t _size;
+    uint16_t _blockCount = 0;
     uint16_t _tmr = 0;
     uint16_t _ramCrc = 0;
     uint16_t _storeCrc = 0;

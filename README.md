@@ -12,6 +12,7 @@
 - Контроль целостности данных
 - Автоматическое обнаружение изменений по CRC
 - Отложенная запись после прекращения изменений
+- Хранение нескольких переменных и структур как одного блока без копирования в общий буфер
 - Версия данных для сброса несовместимого формата
 - Сохранение старых полей при увеличении структуры
 - Три стратегии записи файлов: Direct / Atomic / Backup
@@ -29,6 +30,7 @@
 ```cpp
 SaverEE(T& data, uint16_t addr = 0, uint8_t ver = 'A', uint8_t toutSec = 10);
 SaverEE(void* data, uint16_t size, uint16_t addr = 0, uint8_t ver = 'A', uint8_t toutSec = 10);
+SaverEE(SaverBlocks blocks, uint16_t addr = 0, uint8_t ver = 'A', uint8_t toutSec = 10);
 ```
 
 - `data` - переменная, структура, массив или другой блок данных
@@ -51,6 +53,7 @@ SaverEE statSaver(stat, cfgSaver.nextAddr(), 'A');
 ```cpp
 SaverFile(fs::FS& fs, const char* path, T& data, uint8_t ver = 'A', uint8_t toutSec = 10, FileStore::Mode mode = FileStore::Atomic);
 SaverFile(fs::FS& fs, const char* path, void* data, uint16_t size, uint8_t ver = 'A', uint8_t toutSec = 10, FileStore::Mode mode = FileStore::Atomic);
+SaverFile(fs::FS& fs, const char* path, SaverBlocks blocks, uint8_t ver = 'A', uint8_t toutSec = 10, FileStore::Mode mode = FileStore::Atomic);
 ```
 
 - `fs` - файловая система
@@ -177,6 +180,32 @@ saver.tick(!radioBusy);
 
 По умолчанию запись разрешена.
 
+### Несколько блоков данных
+
+Можно объединить несколько переменных, структур и массивов в один логический блок для `SaverEE` или `SaverFile`:
+
+```cpp
+struct Config { int value = 123; };
+struct Stats { uint32_t counter = 0; };
+
+Config config;
+Stats stats;
+uint8_t buffer[16];
+
+SaverBlock blocks[] = {
+    saverBlock(config),
+    saverBlock(stats),
+    saverBlock(buffer),
+};
+
+SaverFile saver(LittleFS, "/data.bin", saverBlocks(blocks));
+// SaverEE saver(saverBlocks(blocks));
+```
+
+`saverBlock(obj)` автоматически определяет адрес и размер объекта. `saverBlocks(blocks)` автоматически определяет число блоков, а `saverBlocks(blocks, count)` позволяет указать его явно. Версию и другие параметры можно передать после `saverBlocks(...)`. Массив дескрипторов и подключённые данные должны существовать всё время работы Saver.
+
+Блоки сохраняются подряд в указанном порядке с общими версией и CRC. Для `beginGrow()` допустимо добавлять данные только **в конец общей последовательности**: изменение размера блока в середине сместит следующие данные.
+
 ### Безопасная запись
 
 `SaverFile` использует отдельный helper `FileStore`, который поддерживает три стратегии записи:
@@ -205,11 +234,11 @@ FileStore::Backup
 /config.cfg.b
 ```
 
-Новые данные сначала записываются в `.t`, старый основной файл переносится в `.b`, после чего `.t` становится основным. После успешного завершения backup удаляется. Этот режим не полагается на atomic replace и используется в `SaverFile` по умолчанию.
+Новые данные сначала записываются в `.t`, старый основной файл переносится в `.b`, после чего `.t` становится основным. После успешного завершения backup удаляется. Этот режим не полагается на atomic replace. По умолчанию `SaverFile` использует `Atomic`.
 
 Перед чтением и записью `SaverFile` выполняет recovery: проверяет основной, временный и backup-файл по CRC и восстанавливает валидную копию после незавершённой записи.
 
-Для LittleFS можно явно выбрать более лёгкий `Atomic`:
+Для LittleFS режим `Atomic` выбран по умолчанию. Его также можно указать явно:
 
 ```cpp
 SaverFile saver(

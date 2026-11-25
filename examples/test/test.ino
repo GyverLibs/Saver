@@ -590,6 +590,134 @@ void testSaverAtomicMode() {
     cleanup(path);
 }
 
+void testSaverBlocks() {
+    Serial.println("\n--- SaverFile multiple blocks ---");
+
+    const char* path = "/sv_blocks";
+    cleanup(path);
+
+    Config cfg = {123, 1};
+    uint16_t counter = 50;
+    uint8_t flags[3] = {1, 2, 3};
+    SaverBlock blocks[] = {saverBlock(cfg), saverBlock(counter), saverBlock(flags)};
+    SaverFile saver(LittleFS, path, saverBlocks(blocks));
+    const uint16_t total = sizeof(cfg) + sizeof(counter) + sizeof(flags);
+
+    check(saver.dataSize() == total && saver.begin() == Saver::Default,
+          "Blocks saverBlocks(array) and first begin");
+
+    cfg.value = 456;
+    counter = 789;
+    flags[0] = 4;
+    flags[2] = 6;
+    check(saver.write() == Saver::Write && saver.write() == Saver::None,
+          "Blocks write and unchanged detection");
+
+    Config readCfg = {-1, 0};
+    uint16_t readCounter = 0;
+    uint8_t readFlags[3] = {};
+    const SaverBlock readBlocks[] = {saverBlock(readCfg), saverBlock(readCounter), saverBlock(readFlags)};
+    SaverFile reader(LittleFS, path, saverBlocks(readBlocks));
+    check(reader.begin() == Saver::Read && readCfg.value == 456 && readCfg.enabled == 1 &&
+              readCounter == 789 && readFlags[0] == 4 && readFlags[1] == 2 && readFlags[2] == 6,
+          "Blocks read into const descriptor array");
+
+    // блочная запись должна совпадать с обычным непрерывным форматом
+    uint8_t flat[sizeof(cfg) + sizeof(counter) + sizeof(flags)] = {};
+    SaverFile flatReader(LittleFS, path, (void*)flat, sizeof(flat));
+    uint8_t expected[sizeof(flat)];
+    memcpy(expected, &cfg, sizeof(cfg));
+    memcpy(expected + sizeof(cfg), &counter, sizeof(counter));
+    memcpy(expected + sizeof(cfg) + sizeof(counter), flags, sizeof(flags));
+    check(flatReader.begin() == Saver::Read && memcmp(flat, expected, sizeof(flat)) == 0,
+          "Blocks binary format matches contiguous data");
+
+    // reset(raw) раскладывает один буфер обратно по разным участкам RAM
+    uint8_t defaults[sizeof(flat)] = {};
+    Config defaultCfg = {42, 0};
+    uint16_t defaultCounter = 1000;
+    uint8_t defaultFlags[3] = {7, 8, 9};
+    memcpy(defaults, &defaultCfg, sizeof(defaultCfg));
+    memcpy(defaults + sizeof(defaultCfg), &defaultCounter, sizeof(defaultCounter));
+    memcpy(defaults + sizeof(defaultCfg) + sizeof(defaultCounter), defaultFlags, sizeof(defaultFlags));
+    check(saver.reset(defaults, sizeof(defaults)) == Saver::Write &&
+              cfg.value == 42 && cfg.enabled == 0 && counter == 1000 &&
+              memcmp(flags, defaultFlags, sizeof(flags)) == 0,
+          "Blocks reset(raw) scatters data into RAM");
+
+    Config verifyCfg = {0, 1};
+    uint16_t verifyCounter = 0;
+    uint8_t verifyFlags[3] = {};
+    SaverBlock verifyBlocks[] = {saverBlock(verifyCfg), saverBlock(verifyCounter), saverBlock(verifyFlags)};
+    SaverFile verify(LittleFS, path, saverBlocks(verifyBlocks, 3), 'A', 0);
+    check(verify.begin() == Saver::Read && verifyCfg.value == 42 && verifyCfg.enabled == 0 &&
+              verifyCounter == 1000 && memcmp(verifyFlags, defaultFlags, sizeof(verifyFlags)) == 0,
+          "Blocks saverBlocks(array, count) and reset persistence");
+
+    cleanup(path);
+}
+
+void testSaverBlocksGrow() {
+    Serial.println("\n--- SaverFile blocks grow ---");
+
+    const char* path = "/sv_bgrow";
+    cleanup(path);
+
+    uint16_t a = 1234;
+    uint8_t b[2] = {5, 6};
+    SaverBlock oldBlocks[] = {saverBlock(a), saverBlock(b)};
+    SaverFile oldSaver(LittleFS, path, saverBlocks(oldBlocks));
+    bool initialized = oldSaver.begin() == Saver::Default;
+    a = 4321;
+    b[0] = 9;
+    bool saved = oldSaver.write() == Saver::Write;
+
+    uint16_t newA = 0;
+    uint8_t newB[2] = {};
+    uint32_t tail = 0x12345678;
+    SaverBlock newBlocks[] = {saverBlock(newA), saverBlock(newB), saverBlock(tail)};
+    SaverFile grown(LittleFS, path, saverBlocks(newBlocks));
+    check(initialized && saved && grown.beginGrow() == Saver::Grow &&
+              newA == 4321 && newB[0] == 9 && newB[1] == 6 && tail == 0x12345678,
+          "Blocks beginGrow appends a new block");
+
+    uint16_t readA = 0;
+    uint8_t readB[2] = {};
+    uint32_t readTail = 0;
+    SaverBlock readBlocks[] = {saverBlock(readA), saverBlock(readB), saverBlock(readTail)};
+    SaverFile reader(LittleFS, path, saverBlocks(readBlocks));
+    check(reader.begin() == Saver::Read && readA == 4321 && readB[0] == 9 &&
+              readB[1] == 6 && readTail == 0x12345678,
+          "Blocks grown layout persists");
+
+    cleanup(path);
+}
+
+void testSaverBlocksInvalid() {
+    Serial.println("\n--- SaverFile invalid blocks ---");
+
+    const char* path = "/sv_binvalid";
+    cleanup(path);
+
+    uint8_t value = 1;
+    SaverBlock nullBlock[] = {{nullptr, 1}, saverBlock(value)};
+    SaverFile invalidPointer(LittleFS, path, saverBlocks(nullBlock));
+    check(invalidPointer.begin() == Saver::Error && !LittleFS.exists(path),
+          "Blocks reject null data pointer");
+
+    SaverBlock emptyBlock[] = {{&value, 0}};
+    SaverFile invalidSize(LittleFS, path, saverBlocks(emptyBlock));
+    check(invalidSize.begin() == Saver::Error && !LittleFS.exists(path),
+          "Blocks reject zero-sized descriptor");
+
+    SaverBlock oversized[] = {{&value, UINT16_MAX}, {&value, 1}};
+    SaverFile invalidTotal(LittleFS, path, saverBlocks(oversized));
+    check(invalidTotal.begin() == Saver::Error && !LittleFS.exists(path),
+          "Blocks reject total size overflow");
+
+    cleanup(path);
+}
+
 void testSaverTickGate() {
     Serial.println("\n--- SaverFile tick(allowWrite) ---");
     Serial.println("This test takes about 3-4 seconds.");
@@ -647,7 +775,8 @@ void cleanupAll() {
     const char* paths[] = {
         "/fst_dir", "/fst_at", "/fst_am", "/fst_bk", "/fst_bm",
         "/fst_rm", "/fst_pa", "/fst_pb",
-        "/sv_basic", "/sv_grow", "/sv_reset", "/sv_atom", "/sv_tick"};
+        "/sv_basic", "/sv_grow", "/sv_reset", "/sv_atom", "/sv_tick",
+        "/sv_blocks", "/sv_bgrow", "/sv_binvalid"};
 
     for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) {
         cleanup(paths[i]);
@@ -690,6 +819,9 @@ void setup() {
     testSaverGrow();
     testSaverReset();
     testSaverAtomicMode();
+    testSaverBlocks();
+    testSaverBlocksGrow();
+    testSaverBlocksInvalid();
     testSaverTickGate();
 
     cleanupAll();
